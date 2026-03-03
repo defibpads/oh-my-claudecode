@@ -52,13 +52,57 @@ function severityMatches(agentSeverity: Severity, gtSeverity: Severity): boolean
 // Keyword matching
 // ============================================================
 
+function normalizeTextForMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[`*_#()[\]{}<>"'.,;!?|\\]/g, ' ')
+    .replace(/[-/:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function keywordMatchesText(text: string, keyword: string): boolean {
+  const lowerText = text.toLowerCase();
+  const lowerKeyword = keyword.toLowerCase();
+
+  if (lowerText.includes(lowerKeyword)) {
+    return true;
+  }
+
+  const normalizedText = normalizeTextForMatch(text);
+  const normalizedKeyword = normalizeTextForMatch(keyword);
+  if (!normalizedKeyword) return false;
+
+  if (normalizedText.includes(normalizedKeyword)) {
+    return true;
+  }
+
+  const keywordParts = normalizedKeyword.split(' ').filter(Boolean);
+  if (keywordParts.length <= 1) return false;
+
+  // Phrase fallback: all phrase tokens present, order-independent.
+  return keywordParts.every((part) => normalizedText.includes(part));
+}
+
 function countKeywordMatches(text: string, keywords: string[]): number {
-  const lower = text.toLowerCase();
-  return keywords.filter((kw) => lower.includes(kw.toLowerCase())).length;
+  return keywords.filter((kw) => keywordMatchesText(text, kw)).length;
+}
+
+function requiredKeywordMatches(keywords: string[]): number {
+  if (keywords.length === 0) return 0;
+
+  // Scale with keyword set size to reduce accidental matches on larger sets:
+  // 4/5 keywords -> 2 required, 6 keywords -> 3 required.
+  const proportional = Math.ceil(keywords.length * 0.4);
+  return Math.min(
+    keywords.length,
+    Math.max(MIN_KEYWORD_MATCHES, proportional),
+  );
 }
 
 function textMatchesGroundTruth(text: string, gt: GroundTruthFinding): boolean {
-  return countKeywordMatches(text, gt.keywords) >= MIN_KEYWORD_MATCHES;
+  return countKeywordMatches(text, gt.keywords) >= requiredKeywordMatches(gt.keywords);
 }
 
 // ============================================================
@@ -184,7 +228,7 @@ function computeSeverityAccuracy(
     let matchIdx = -1;
     for (let i = 0; i < allParsed.length; i++) {
       if (usedAgentIndices.has(i)) continue;
-      if (countKeywordMatches(allParsed[i].text, gt.keywords) >= MIN_KEYWORD_MATCHES) {
+      if (countKeywordMatches(allParsed[i].text, gt.keywords) >= requiredKeywordMatches(gt.keywords)) {
         matchIdx = i;
         break;
       }

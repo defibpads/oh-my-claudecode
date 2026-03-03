@@ -1,16 +1,16 @@
 import { describe, test, expect } from 'vitest';
 // NOTE: This test is excluded from tsconfig.json (rootDir is src/, benchmarks/ is outside).
 // Vitest handles its own TypeScript compilation so static imports work fine here.
-import { parseAgentOutput } from '../../benchmarks/harsh-critic/scoring/parser.js';
-import { matchFindings, scoreFixture, aggregateScores } from '../../benchmarks/harsh-critic/scoring/scorer.js';
-import { generateJsonReport, generateMarkdownReport } from '../../benchmarks/harsh-critic/scoring/reporter.js';
+import { parseAgentOutput } from '../../benchmarks/harsh-critic/scoring/parser.ts';
+import { matchFindings, scoreFixture, aggregateScores } from '../../benchmarks/harsh-critic/scoring/scorer.ts';
+import { generateJsonReport, generateMarkdownReport } from '../../benchmarks/harsh-critic/scoring/reporter.ts';
 import type {
   GroundTruth,
   GroundTruthFinding,
   ParsedAgentOutput,
   FixtureResult,
   BenchmarkScores,
-} from '../../benchmarks/harsh-critic/scoring/types.js';
+} from '../../benchmarks/harsh-critic/scoring/types.ts';
 
 // ============================================================
 // Canned test data
@@ -62,6 +62,37 @@ const SAMPLE_CRITIC_OUTPUT_BARE_VERDICT = `**REJECT**
 - Database connection pool not sized for new load`;
 
 const SAMPLE_EMPTY_OUTPUT = '';
+
+const SAMPLE_MARKDOWN_HEADING_OUTPUT = `**VERDICT: REJECT**
+
+## Pre-commitment Predictions
+1. Task ordering issues
+
+## Critical Findings
+**1. Dual-write starts before schema readiness**
+- **Evidence:** \`plan-auth-migration.md:117\`
+- **Why this matters:** Deployment can fail mid-rollout.
+- **Fix:** Gate dual-write behind completed migration.
+
+## Major Findings
+**1. No rollback drill documented**
+- **Evidence:** processPayment():47-52
+- **Why this matters:** Rollback quality is unverified.
+- **Fix:** Add rollback test runbook.
+
+## Minor Findings
+- Naming inconsistency remains.
+
+## What's Missing
+- No load testing strategy
+
+## Phase 3 — Multi-Perspective Review
+### Security Engineer Perspective
+- JWT secret rotation not addressed
+### New-Hire Perspective
+- RBAC model is assumed and undocumented
+### Ops Engineer Perspective
+- No circuit breaker for OAuth downtime`;
 
 // ============================================================
 // Helpers to build minimal test fixtures
@@ -259,6 +290,44 @@ describe('Parser', () => {
       const result = parseAgentOutput(SAMPLE_HARSH_CRITIC_OUTPUT, 'harsh-critic');
       expect(result.rawOutput).toBe(SAMPLE_HARSH_CRITIC_OUTPUT);
     });
+
+    test('parses markdown heading sections (##) and bold-number findings', () => {
+      const result = parseAgentOutput(SAMPLE_MARKDOWN_HEADING_OUTPUT, 'harsh-critic');
+      expect(result.hasPreCommitment).toBe(true);
+      expect(result.criticalFindings).toHaveLength(1);
+      expect(result.majorFindings).toHaveLength(1);
+      expect(result.minorFindings).toHaveLength(1);
+      expect(result.missingItems).toHaveLength(1);
+    });
+
+    test('parses perspective subsection headings under multi-perspective review', () => {
+      const result = parseAgentOutput(SAMPLE_MARKDOWN_HEADING_OUTPUT, 'harsh-critic');
+      expect(result.hasMultiPerspective).toBe(true);
+      expect(result.perspectiveNotes.security).toHaveLength(1);
+      expect(result.perspectiveNotes.newHire).toHaveLength(1);
+      expect(result.perspectiveNotes.ops).toHaveLength(1);
+      expect(result.perspectiveNotes.security[0]).toContain('JWT secret rotation');
+    });
+
+    test('treats "None." as no missing items but still marks gap-analysis section as present', () => {
+      const output = `**VERDICT: ACCEPT**
+
+## What's Missing
+None.`;
+      const result = parseAgentOutput(output, 'harsh-critic');
+      expect(result.hasGapAnalysis).toBe(true);
+      expect(result.missingItems).toHaveLength(0);
+    });
+
+    test('hasEvidence is true for function():line-range evidence markers', () => {
+      const output = `**VERDICT: REJECT**
+
+## Major Findings
+1. Retry behavior is unsafe at processPayment():47-52`;
+      const result = parseAgentOutput(output, 'harsh-critic');
+      expect(result.majorFindings).toHaveLength(1);
+      expect(result.majorFindings[0].hasEvidence).toBe(true);
+    });
   });
 
   describe('critic format', () => {
@@ -315,6 +384,16 @@ describe('Parser', () => {
       const result = parseAgentOutput(SAMPLE_CRITIC_OUTPUT, 'critic');
       expect(result.majorFindings.length).toBeGreaterThan(0);
       expect(result.majorFindings[0].severity).toBe('MAJOR');
+    });
+
+    test('extracts critic findings from markdown heading summary format', () => {
+      const output = `**[REJECT]**
+
+## Summary
+- Missing rollback strategy
+- Rate limiting not defined`;
+      const result = parseAgentOutput(output, 'critic');
+      expect(result.majorFindings).toHaveLength(2);
     });
   });
 
@@ -450,6 +529,79 @@ describe('Scorer', () => {
         criticalFindings: [
           {
             text: 'ValidateSession must be renamed to VerifySession.',
+            severity: 'CRITICAL',
+            hasEvidence: false,
+          },
+        ],
+      });
+
+      const result = matchFindings(parsed, gt);
+      expect(result.matchedIds).toContain('F1');
+    });
+
+    test('matching is robust to punctuation and hyphen variants', () => {
+      const gt = makeGroundTruth({
+        findings: [
+          makeGroundTruthFinding({
+            id: 'F1',
+            keywords: ['new-hire', 'sameSite', 'cookie', 'csrf'],
+          }),
+        ],
+      });
+
+      const parsed = makeParsedOutput({
+        criticalFindings: [
+          {
+            text: 'New hire note: session cookie is missing SameSite and enables CSRF risk.',
+            severity: 'CRITICAL',
+            hasEvidence: false,
+          },
+        ],
+      });
+
+      const result = matchFindings(parsed, gt);
+      expect(result.matchedIds).toContain('F1');
+    });
+
+    test('requires 3 keyword matches when ground truth has 6 keywords', () => {
+      const gt = makeGroundTruth({
+        findings: [
+          makeGroundTruthFinding({
+            id: 'F1',
+            keywords: ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'],
+          }),
+        ],
+      });
+
+      const parsed = makeParsedOutput({
+        criticalFindings: [
+          {
+            text: 'alpha bravo issue only',
+            severity: 'CRITICAL',
+            hasEvidence: false,
+          },
+        ],
+      });
+
+      const result = matchFindings(parsed, gt);
+      expect(result.matchedIds).toHaveLength(0);
+      expect(result.missedIds).toContain('F1');
+    });
+
+    test('matches 6-keyword ground truth when 3 keywords overlap', () => {
+      const gt = makeGroundTruth({
+        findings: [
+          makeGroundTruthFinding({
+            id: 'F1',
+            keywords: ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'],
+          }),
+        ],
+      });
+
+      const parsed = makeParsedOutput({
+        criticalFindings: [
+          {
+            text: 'alpha bravo charlie issue is confirmed',
             severity: 'CRITICAL',
             hasEvidence: false,
           },

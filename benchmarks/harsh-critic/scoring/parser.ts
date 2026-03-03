@@ -18,8 +18,14 @@ import type {
 // Evidence detection
 // ============================================================
 
-/** Matches patterns like `filename.ext:123` or backtick-quoted code references */
-const EVIDENCE_PATTERN = /`[^`]+`|\b\w+\.\w+:\d+/;
+/**
+ * Matches evidence markers such as:
+ * - backtick snippets: `code()`
+ * - path/file refs: src/auth.ts:42, auth.ts:12:5
+ * - function location refs: processPayment():47-52
+ */
+const EVIDENCE_PATTERN =
+  /`[^`]+`|\b(?:[A-Za-z0-9_./-]+\.[A-Za-z0-9_+-]+|[A-Za-z_][A-Za-z0-9_]*\(\)):\d+(?:-\d+)?(?:[:]\d+)?\b/;
 
 function hasEvidence(text: string): boolean {
   return EVIDENCE_PATTERN.test(text);
@@ -29,44 +35,279 @@ function hasEvidence(text: string): boolean {
 // Shared utilities
 // ============================================================
 
-/**
- * Extract bullet / numbered list items under a markdown section heading.
- * Stops at the next `**` heading or end of string.
- */
-function extractListItems(text: string, sectionPattern: RegExp): string[] {
-  const match = sectionPattern.exec(text);
-  if (!match) return [];
+type PerspectiveKey = 'security' | 'newHire' | 'ops';
 
-  const start = match.index + match[0].length;
-  // Find next bold heading or end of string
-  const nextHeading = /\n\s*\*\*[^\n]+\*\*/g;
-  nextHeading.lastIndex = start;
-  const next = nextHeading.exec(text);
-  const end = next ? next.index : text.length;
+interface SectionBounds {
+  start: number;
+  end: number;
+}
 
-  const section = text.slice(start, end);
-  const items: string[] = [];
+const NUMBERED_ITEM_PATTERN = /^([ \t]*)(?:\*{1,2}\s*)?\d+[.)](?:\*{1,2})?\s+(.+)$/;
+const BULLET_ITEM_PATTERN = /^([ \t]*)[-*•]\s+(.+)$/;
+const LIST_MARKER_PATTERN = /^(?:[-*•]|(?:\*{1,2}\s*)?\d+[.)](?:\*{1,2})?)\s+(.+)$/;
 
-  // Match top-level numbered or bulleted list items (not indented sub-items).
-  // Top-level items start at column 0 (no leading whitespace) or have at most
-  // 1 space of indentation. Sub-items (indented with 2+ spaces or tabs) are
-  // skipped and their text is appended to the previous top-level item.
-  const listItemPattern = /^([ \t]*)(?:\d+\.|[-*•])\s+(.+)/gm;
-  let m: RegExpExecArray | null;
-  while ((m = listItemPattern.exec(section)) !== null) {
-    const indent = m[1].replace(/\t/g, '  ').length;
-    const itemText = m[2].trim();
-    if (!itemText) continue;
+// Common subfields used inside a finding item; keep them attached to the parent item.
+const SUBFIELD_PATTERN =
+  /^(?:\*{1,2})?(?:evidence|why this matters|fix|impact|risk|mitigation|proof|location|example|note)\b/i;
 
-    if (indent >= 2 && items.length > 0) {
-      // Sub-item: append to the last top-level item for context
-      items[items.length - 1] += ' ' + itemText;
-    } else {
-      items.push(itemText);
+function normalizeHeadingLine(line: string): string {
+  let normalized = line.trim();
+  normalized = normalized.replace(/^#{1,6}\s*/, '');
+  normalized = normalized.replace(/^\*{1,2}\s*/, '');
+  normalized = normalized.replace(/\s*\*{1,2}\s*:?\s*$/, '');
+  normalized = normalized.replace(/[—–]/g, '-');
+  normalized = normalized.replace(/\s+/g, ' ');
+  return normalized.trim().toLowerCase();
+}
+
+function isHorizontalRule(line: string): boolean {
+  return /^\s*(?:---+|\*\*\*+)\s*$/.test(line);
+}
+
+function isHeadingLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+
+  if (isHorizontalRule(trimmed)) return true;
+  if (/^#{1,6}\s+\S/.test(trimmed)) return true;
+
+  // Bold-numbered lines like "**1. Finding**" are list items, not headings.
+  if (/^\*{1,2}\s*\d+[.)]\s+/.test(trimmed)) return false;
+
+  if (/^\*{1,2}[^*\n]+?\*{1,2}(?:\s*\([^)\n]*\))?\s*:?\s*$/.test(trimmed)) {
+    return true;
+  }
+
+  if (/^[A-Za-z][A-Za-z0-9'() \-/]{2,}:\s*$/.test(trimmed)) {
+    return true;
+  }
+
+  return false;
+}
+
+function lineMatchesAnyHeadingAlias(line: string, aliases: RegExp[]): boolean {
+  const normalized = normalizeHeadingLine(line);
+  return aliases.some((alias) => alias.test(normalized));
+}
+
+function findSectionHeadingIndex(lines: string[], aliases: RegExp[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    if (lineMatchesAnyHeadingAlias(lines[i], aliases)) return i;
+  }
+  return -1;
+}
+
+function findSectionBounds(lines: string[], aliases: RegExp[]): SectionBounds | null {
+  const headingIndex = findSectionHeadingIndex(lines, aliases);
+  if (headingIndex === -1) return null;
+
+  const start = headingIndex + 1;
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    if (isHeadingLine(lines[i])) {
+      end = i;
+      break;
     }
   }
 
+  return { start, end };
+}
+
+function hasSection(lines: string[], aliases: RegExp[]): boolean {
+  return findSectionHeadingIndex(lines, aliases) !== -1;
+}
+
+function extractListItemsFromSection(sectionLines: string[]): string[] {
+  const items: string[] = [];
+  let current = '';
+  let currentKind: 'numbered' | 'bullet' | null = null;
+
+  const flush = () => {
+    const item = current.trim();
+    if (item && !/^none\.?$/i.test(item)) {
+      items.push(item);
+    }
+    current = '';
+    currentKind = null;
+  };
+
+  for (const rawLine of sectionLines) {
+    const line = rawLine.replace(/\r/g, '');
+    const trimmed = line.trim();
+
+    if (!trimmed || isHorizontalRule(trimmed)) {
+      flush();
+      continue;
+    }
+
+    const numbered = NUMBERED_ITEM_PATTERN.exec(line);
+    if (numbered) {
+      flush();
+      current = numbered[2].trim();
+      currentKind = 'numbered';
+      continue;
+    }
+
+    const bullet = BULLET_ITEM_PATTERN.exec(line);
+    if (bullet) {
+      const indent = bullet[1].replace(/\t/g, '  ').length;
+      const text = bullet[2].trim();
+      if (!text) continue;
+
+      // Many model outputs use unindented "-" sub-bullets after numbered headings
+      // (Evidence/Why/Fix). Keep those attached to the parent finding.
+      const appendToCurrent =
+        current.length > 0 &&
+        (indent >= 2 || currentKind === 'numbered' || SUBFIELD_PATTERN.test(text));
+
+      if (appendToCurrent) {
+        current += ' ' + text;
+      } else {
+        flush();
+        current = text;
+        currentKind = 'bullet';
+      }
+      continue;
+    }
+
+    // Plain continuation prose inside the active item.
+    if (current.length > 0) {
+      current += ' ' + trimmed;
+    }
+  }
+
+  flush();
   return items;
+}
+
+function extractSectionItems(lines: string[], aliases: RegExp[]): string[] {
+  const bounds = findSectionBounds(lines, aliases);
+  if (!bounds) return [];
+  return extractListItemsFromSection(lines.slice(bounds.start, bounds.end));
+}
+
+function dedupeStrings(items: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const item of items) {
+    const key = item.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item.trim());
+  }
+  return deduped;
+}
+
+function detectPerspectiveHeading(line: string): PerspectiveKey | null {
+  const normalized = normalizeHeadingLine(line);
+
+  if (
+    /\bsecurity\b(?:\s+engineer)?(?:\s+perspective)?\b/.test(normalized) ||
+    normalized === 'security'
+  ) {
+    return 'security';
+  }
+  if (
+    /\bnew[- ]?hire\b(?:\s+perspective)?\b/.test(normalized) ||
+    normalized === 'new-hire' ||
+    normalized === 'new hire'
+  ) {
+    return 'newHire';
+  }
+  if (
+    /\bops\b(?:\s+engineer)?(?:\s+perspective)?\b/.test(normalized) ||
+    normalized === 'ops'
+  ) {
+    return 'ops';
+  }
+
+  return null;
+}
+
+function parsePerspectiveNotes(
+  lines: string[],
+  multiPerspectiveHeadingIndex: number,
+): { security: string[]; newHire: string[]; ops: string[] } {
+  const notes = {
+    security: [] as string[],
+    newHire: [] as string[],
+    ops: [] as string[],
+  };
+
+  const scopedLines =
+    multiPerspectiveHeadingIndex >= 0
+      ? lines.slice(multiPerspectiveHeadingIndex + 1)
+      : lines;
+
+  const pushNote = (key: PerspectiveKey, value: string) => {
+    const text = value.trim();
+    if (!text || /^none\.?$/i.test(text)) return;
+    notes[key].push(text);
+  };
+
+  // Pass 1: inline labels like "- Security: ..."
+  for (const line of scopedLines) {
+    const bullet = BULLET_ITEM_PATTERN.exec(line);
+    if (!bullet) continue;
+    const inline = /^(Security|New-?hire|Ops)\s*:\s*(.+)$/i.exec(bullet[2].trim());
+    if (!inline) continue;
+
+    const label = inline[1].toLowerCase();
+    const content = inline[2].trim();
+    if (label === 'security') pushNote('security', content);
+    else if (label.startsWith('new')) pushNote('newHire', content);
+    else pushNote('ops', content);
+  }
+
+  // Pass 2: subsection headings like "### Security Engineer Perspective"
+  let currentPerspective: PerspectiveKey | null = null;
+  let currentItem = '';
+  const flushCurrent = () => {
+    if (currentPerspective && currentItem.trim()) {
+      pushNote(currentPerspective, currentItem.trim());
+    }
+    currentItem = '';
+  };
+
+  for (const line of scopedLines) {
+    const trimmed = line.trim();
+
+    if (!trimmed || isHorizontalRule(trimmed)) {
+      flushCurrent();
+      continue;
+    }
+
+    if (isHeadingLine(line)) {
+      const headingPerspective = detectPerspectiveHeading(line);
+      if (headingPerspective) {
+        flushCurrent();
+        currentPerspective = headingPerspective;
+        continue;
+      }
+      flushCurrent();
+      currentPerspective = null;
+      continue;
+    }
+
+    if (!currentPerspective) continue;
+
+    const listContent = LIST_MARKER_PATTERN.exec(trimmed);
+    if (listContent) {
+      flushCurrent();
+      currentItem = listContent[1].trim();
+      continue;
+    }
+
+    currentItem = currentItem ? `${currentItem} ${trimmed}` : trimmed;
+  }
+
+  flushCurrent();
+
+  return {
+    security: dedupeStrings(notes.security),
+    newHire: dedupeStrings(notes.newHire),
+    ops: dedupeStrings(notes.ops),
+  };
 }
 
 /**
@@ -80,6 +321,18 @@ function toFinding(text: string, severity: Severity): ParsedFinding {
 // Harsh-critic parser
 // ============================================================
 
+const PRECOMMIT_ALIASES = [/\bpre-?commitment\s+predictions?\b/];
+const CRITICAL_ALIASES = [/\bcritical\s+findings?\b/];
+const MAJOR_ALIASES = [/\bmajor\s+findings?\b/];
+const MINOR_ALIASES = [/\bminor\s+findings?\b/];
+const MISSING_ALIASES = [/\bwhat'?s?\s+missing\b/];
+const MULTI_PERSPECTIVE_ALIASES = [
+  /\bmulti-?perspective\b.*\b(?:notes?|review)\b/,
+  /\bphase\s*\d+\b.*\bmulti-?perspective\b/,
+];
+const SUMMARY_ALIASES = [/\bsummary\b/];
+const JUSTIFICATION_ALIASES = [/\bjustification\b/];
+
 function parseVerdict(text: string): string {
   // Match: **VERDICT: REJECT** or **VERDICT: ACCEPT-WITH-RESERVATIONS**
   const m = /\*{1,2}VERDICT\s*:\s*([A-Z][A-Z\s-]*?)\*{1,2}/i.exec(text);
@@ -92,70 +345,39 @@ function parseVerdict(text: string): string {
   return '';
 }
 
-function parseFindingsSection(text: string, headingPattern: RegExp, severity: Severity): ParsedFinding[] {
-  return extractListItems(text, headingPattern).map((item) => toFinding(item, severity));
-}
-
-function parsePerspectiveSection(
-  text: string,
-  perspPattern: RegExp,
-): string[] {
-  return extractListItems(text, perspPattern);
+function parseFindingsSection(lines: string[], aliases: RegExp[], severity: Severity): ParsedFinding[] {
+  return extractSectionItems(lines, aliases).map((item) => toFinding(item, severity));
 }
 
 function parseHarshCritic(rawOutput: string): ParsedAgentOutput {
+  const lines = rawOutput.split(/\r?\n/);
+
   // Verdict
   const verdict = parseVerdict(rawOutput);
 
   // Pre-commitment predictions
-  const hasPreCommitment =
-    /\*{1,2}Pre-?commitment\s+Predictions?\*{1,2}/i.test(rawOutput);
+  const hasPreCommitment = hasSection(lines, PRECOMMIT_ALIASES);
 
   // Findings sections
-  const criticalPattern =
-    /\*{1,2}Critical\s+Findings?\*{1,2}[:\s]*/i;
-  const majorPattern =
-    /\*{1,2}Major\s+Findings?\*{1,2}[:\s]*/i;
-  const minorPattern =
-    /\*{1,2}Minor\s+Findings?\*{1,2}[:\s]*/i;
-
-  const criticalFindings = parseFindingsSection(rawOutput, criticalPattern, 'CRITICAL');
-  const majorFindings = parseFindingsSection(rawOutput, majorPattern, 'MAJOR');
-  const minorFindings = parseFindingsSection(rawOutput, minorPattern, 'MINOR');
+  const criticalFindings = parseFindingsSection(lines, CRITICAL_ALIASES, 'CRITICAL');
+  const majorFindings = parseFindingsSection(lines, MAJOR_ALIASES, 'MAJOR');
+  const minorFindings = parseFindingsSection(lines, MINOR_ALIASES, 'MINOR');
 
   // What's Missing
-  const missingPattern = /\*{1,2}What'?s?\s+Missing\*{1,2}[:\s]*/i;
-  const missingItems = extractListItems(rawOutput, missingPattern);
-  const hasGapAnalysis = missingItems.length > 0;
+  const missingItems = extractSectionItems(lines, MISSING_ALIASES);
+  const hasGapAnalysis = hasSection(lines, MISSING_ALIASES);
 
-  // Multi-Perspective Notes
-  const multiPerspPattern = /\*{1,2}Multi-?Perspective\s+Notes?\*{1,2}/i;
-  const hasMultiPerspective = multiPerspPattern.test(rawOutput);
-
-  // Try structured sub-headings first (e.g., **Security**: ...)
-  const securityPattern = /\*{1,2}Security\*{1,2}[:\s]*/i;
-  const newHirePattern = /\*{1,2}New-?hire\*{1,2}[:\s]*/i;
-  const opsPattern = /\*{1,2}Ops\*{1,2}[:\s]*/i;
-
-  let security = parsePerspectiveSection(rawOutput, securityPattern);
-  let newHire = parsePerspectiveSection(rawOutput, newHirePattern);
-  let ops = parsePerspectiveSection(rawOutput, opsPattern);
-
-  // Fallback: extract inline perspective items from Multi-Perspective Notes section
-  // Handles format: "- Security: JWT secret rotation not addressed"
-  if (hasMultiPerspective && security.length === 0 && newHire.length === 0 && ops.length === 0) {
-    const perspItems = extractListItems(rawOutput, multiPerspPattern);
-    for (const item of perspItems) {
-      const perspMatch = /^(Security|New-?hire|Ops)\s*:\s*(.+)/i.exec(item);
-      if (perspMatch) {
-        const label = perspMatch[1].toLowerCase();
-        const content = perspMatch[2].trim();
-        if (label === 'security') security.push(content);
-        else if (label.startsWith('new')) newHire.push(content);
-        else if (label === 'ops') ops.push(content);
-      }
-    }
-  }
+  // Multi-Perspective Notes/Review
+  const multiPerspectiveHeadingIndex = findSectionHeadingIndex(
+    lines,
+    MULTI_PERSPECTIVE_ALIASES,
+  );
+  const perspectiveNotes = parsePerspectiveNotes(lines, multiPerspectiveHeadingIndex);
+  const hasMultiPerspective =
+    multiPerspectiveHeadingIndex !== -1 ||
+    perspectiveNotes.security.length > 0 ||
+    perspectiveNotes.newHire.length > 0 ||
+    perspectiveNotes.ops.length > 0;
 
   return {
     verdict,
@@ -163,7 +385,7 @@ function parseHarshCritic(rawOutput: string): ParsedAgentOutput {
     majorFindings,
     minorFindings,
     missingItems,
-    perspectiveNotes: { security, newHire, ops },
+    perspectiveNotes,
     hasPreCommitment,
     hasGapAnalysis,
     hasMultiPerspective,
@@ -193,10 +415,11 @@ function parseCriticVerdict(text: string): string {
  * Each numbered list item or dash-bullet becomes a MAJOR finding (default severity).
  */
 function parseCriticFindings(text: string): ParsedFinding[] {
-  const summaryPattern =
-    /\*{1,2}(?:Summary|Justification)\s*:?\*{1,2}[:\s]*/i;
-  const items = extractListItems(text, summaryPattern);
-  return items.map((item) => toFinding(item, 'MAJOR'));
+  const lines = text.split(/\r?\n/);
+  const summaryItems = extractSectionItems(lines, SUMMARY_ALIASES);
+  const justificationItems = extractSectionItems(lines, JUSTIFICATION_ALIASES);
+  const merged = dedupeStrings([...summaryItems, ...justificationItems]);
+  return merged.map((item) => toFinding(item, 'MAJOR'));
 }
 
 function parseCritic(rawOutput: string): ParsedAgentOutput {
