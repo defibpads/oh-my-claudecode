@@ -84,6 +84,7 @@ export interface PersistentModeResult {
 /** Maximum todo-continuation attempts before giving up (prevents infinite loops) */
 const MAX_TODO_CONTINUATION_ATTEMPTS = 5;
 const CANCEL_SIGNAL_TTL_MS = 30_000;
+const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 
 /** Track todo-continuation attempts per session to prevent infinite loops */
 const todoContinuationAttempts = new Map<string, number>();
@@ -137,6 +138,32 @@ function isSessionCancelInProgress(directory: string, sessionId?: string): boole
   } catch {
     return false;
   }
+}
+
+/**
+ * Treat mode state as stale if it has not been refreshed recently.
+ * Stale files are ignored so they cannot falsely block new sessions.
+ * Uses the freshest of last_checked_at, updated_at, or started_at.
+ */
+function isStaleState(state: unknown): boolean {
+  if (!state || typeof state !== 'object') {
+    return true;
+  }
+
+  const stateRecord = state as Record<string, unknown>;
+  const timestamps = [stateRecord.last_checked_at, stateRecord.updated_at, stateRecord.started_at]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0);
+
+  const mostRecent = timestamps.reduce((max, value) => {
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) && parsed > max ? parsed : max;
+  }, 0);
+
+  if (mostRecent === 0) {
+    return true;
+  }
+
+  return Date.now() - mostRecent > STALE_STATE_THRESHOLD_MS;
 }
 
 /**
@@ -483,7 +510,7 @@ async function checkRalphLoop(
     ? resolveSessionStatePath('ralph', sessionId, workingDir)
     : resolveStatePath('ralph', workingDir);
 
-  if (!state || !state.active) {
+  if (!state || !state.active || isStaleState(state)) {
     return null;
   }
 
@@ -539,7 +566,7 @@ async function checkRalphLoop(
   // Check team pipeline state coordination
   // When team mode is active alongside ralph, respect team phase transitions
   const teamState = readTeamPipelineState(workingDir, sessionId);
-  if (teamState && teamState.active !== undefined) {
+  if (teamState && teamState.active !== undefined && !isStaleState(teamState)) {
     const teamPhase: TeamPipelinePhase = teamState.phase;
 
     // If team pipeline reached a terminal state, ralph should also complete
@@ -980,8 +1007,17 @@ async function checkRalplan(
 ): Promise<PersistentModeResult | null> {
   const workingDir = resolveToWorktreeRoot(directory);
   const state = readModeState<RalplanState>('ralplan', workingDir, sessionId);
+  const stateRecord = state as any;
+  const hasTimestampFields = Boolean(
+    stateRecord &&
+    ['last_checked_at', 'updated_at', 'started_at'].some((key) =>
+      typeof stateRecord[key] === 'string' && String(stateRecord[key]).length > 0,
+    ),
+  );
 
-  if (!state || !state.active) {
+  // Session-scoped ralplan state can legitimately omit timestamps in CI.
+  // Only apply stale-state suppression when a freshness timestamp exists.
+  if (!state || !state.active || (hasTimestampFields && isStaleState(state))) {
     return null;
   }
 
@@ -1083,7 +1119,7 @@ async function checkUltrawork(
   const workingDir = resolveToWorktreeRoot(directory);
   const state = readUltraworkState(workingDir, sessionId);
 
-  if (!state || !state.active) {
+  if (!state || !state.active || isStaleState(state)) {
     return null;
   }
 
@@ -1330,22 +1366,22 @@ export async function checkPersistentModes(
     }
   }
 
-  // Priority 1.7: Team Pipeline (standalone team mode)
-  // When team runs without ralph, this provides stop-hook blocking.
-  // When team runs with ralph, checkRalphLoop() handles it (Priority 1).
-  // Return ANY non-null result (including circuit breaker shouldBlock=false with message).
-  const teamResult = await checkTeamPipeline(sessionId, workingDir, cancelInProgress);
-  if (teamResult) {
-    return teamResult;
-  }
-
-  // Priority 1.8: Ralplan (standalone consensus planning)
+  // Priority 1.7: Ralplan (standalone consensus planning)
   // Ralplan consensus loops (Planner/Architect/Critic) need hard-blocking.
   // When ralplan runs under ralph, checkRalphLoop() handles it (Priority 1).
   // Return ANY non-null result (including circuit breaker shouldBlock=false with message).
   const ralplanResult = await checkRalplan(sessionId, workingDir, cancelInProgress);
   if (ralplanResult) {
     return ralplanResult;
+  }
+
+  // Priority 1.8: Team Pipeline (standalone team mode)
+  // When team runs without ralph, this provides stop-hook blocking.
+  // When team runs with ralph, checkRalphLoop() handles it (Priority 1).
+  // Return ANY non-null result (including circuit breaker shouldBlock=false with message).
+  const teamResult = await checkTeamPipeline(sessionId, workingDir, cancelInProgress);
+  if (teamResult) {
+    return teamResult;
   }
 
   // Priority 2: Ultrawork Mode (performance mode with persistence)
